@@ -28,6 +28,9 @@
 #define STANDALONE_APP 1
 #include "freewrite_libretro.c"
 
+static FILE *logfp;
+#define LOG(...) do { if (logfp) { fprintf(logfp, __VA_ARGS__); fputc('\n', logfp); fflush(logfp); } } while (0)
+
 /* ---------------------------------------------------------- framebuffer */
 static volatile sig_atomic_t quit_flag;
 static void on_signal(int s) { (void)s; quit_flag = 1; }
@@ -152,12 +155,24 @@ static void handle_key(int code, int val)
 
 #define MAXDEV 32
 static char dev_path[MAXDEV][300];
-static int dev_fd[MAXDEV];      /* >=0 keyboard in use, -1 rejected */
-static int ndev;
+static char dev_name[MAXDEV][64];
+static int dev_fd[MAXDEV];      /* >=0 open for events, -1 unusable */
+static int dev_kb[MAXDEV];      /* 1 = looks like a keyboard */
+static int ndev, nkeyboards;
+static int log_events;
+static char last_ev[160];
+static int nonkb_down;          /* buttons currently held on non-keyboard devices */
+static struct timespec nonkb_since;
 
 static int has_key(const unsigned long *bits, int key)
 {
    return (bits[key / (8 * sizeof(long))] >> (key % (8 * sizeof(long)))) & 1;
+}
+
+static void recount_keyboards(void)
+{
+   nkeyboards = 0;
+   for (int i = 0; i < ndev; i++) if (dev_fd[i] >= 0 && dev_kb[i]) nkeyboards++;
 }
 
 static void scan_inputs(void)
@@ -173,22 +188,30 @@ static void scan_inputs(void)
       for (int i = 0; i < ndev; i++) if (!strcmp(dev_path[i], path)) { known = 1; break; }
       if (known || ndev >= MAXDEV) continue;
       strcpy(dev_path[ndev], path);
-      dev_fd[ndev] = -1;
+      dev_fd[ndev] = -1; dev_kb[ndev] = 0;
+      snprintf(dev_name[ndev], sizeof dev_name[ndev], "(cannot open)");
       int fd = open(path, O_RDONLY | O_NONBLOCK);
       if (fd >= 0) {
-         unsigned long bits[KEY_MAX / (8 * sizeof(long)) + 1];
-         memset(bits, 0, sizeof bits);
-         if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof bits), bits) >= 0 &&
-             has_key(bits, KEY_A) && has_key(bits, KEY_ENTER) && has_key(bits, KEY_SPACE)) {
-            dev_fd[ndev] = fd;
-            fprintf(stderr, "keyboard: %s\n", path);
-         } else {
-            close(fd);
-         }
+         char name[64] = "?";
+         if (ioctl(fd, EVIOCGNAME(sizeof name), name) < 0) strcpy(name, "?");
+         snprintf(dev_name[ndev], sizeof dev_name[ndev], "%s", name);
+         unsigned long evbits[EV_MAX / (8 * sizeof(long)) + 1];
+         unsigned long keybits[KEY_MAX / (8 * sizeof(long)) + 1];
+         memset(evbits, 0, sizeof evbits);
+         memset(keybits, 0, sizeof keybits);
+         ioctl(fd, EVIOCGBIT(0, sizeof evbits), evbits);
+         ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keybits), keybits);
+         int haskeys = has_key(evbits, EV_KEY);
+         int kb = has_key(keybits, KEY_A) && has_key(keybits, KEY_ENTER) && has_key(keybits, KEY_SPACE);
+         if (haskeys) { dev_fd[ndev] = fd; dev_kb[ndev] = kb; } else close(fd);
+         LOG("device %s name='%s' has_keys=%d keyboard=%d", path, name, haskeys, kb);
+      } else {
+         LOG("device %s open failed: %s", path, strerror(errno));
       }
       ndev++;
    }
    closedir(d);
+   recount_keyboards();
 }
 
 static void poll_inputs(void)
@@ -199,9 +222,22 @@ static void poll_inputs(void)
       for (;;) {
          ssize_t n = read(dev_fd[i], &ev, sizeof ev);
          if (n == (ssize_t)sizeof ev) {
-            if (ev.type == EV_KEY) handle_key(ev.code, ev.value);
+            if (ev.type != EV_KEY) continue;
+            if (ev.value != 2) {
+               snprintf(last_ev, sizeof last_ev, "%.40s: code %d value %d", dev_name[i], ev.code, ev.value);
+               if (log_events < 400) { log_events++; LOG("event %s code=%d value=%d", dev_name[i], ev.code, ev.value); }
+            }
+            if (dev_kb[i]) {
+               handle_key(ev.code, ev.value);
+            } else if (ev.value == 1) {
+               if (nonkb_down++ == 0) clock_gettime(CLOCK_MONOTONIC, &nonkb_since);
+            } else if (ev.value == 0 && nonkb_down > 0) {
+               nonkb_down--;
+            }
          } else {
             if (n < 0 && errno != EAGAIN && errno != EINTR) {   /* unplugged */
+               LOG("device removed: %s", dev_path[i]);
+               if (!dev_kb[i]) nonkb_down = 0;
                close(dev_fd[i]);
                dev_fd[i] = -1;
                dev_path[i][0] = 0;   /* allow rediscovery */
@@ -210,11 +246,82 @@ static void poll_inputs(void)
          }
       }
    }
-   /* compact entries cleared by unplug so they can be rescanned */
    int j = 0;
    for (int i = 0; i < ndev; i++)
-      if (dev_path[i][0]) { if (i != j) { strcpy(dev_path[j], dev_path[i]); dev_fd[j] = dev_fd[i]; } j++; }
+      if (dev_path[i][0]) {
+         if (i != j) {
+            strcpy(dev_path[j], dev_path[i]);
+            strcpy(dev_name[j], dev_name[i]);
+            dev_fd[j] = dev_fd[i];
+            dev_kb[j] = dev_kb[i];
+         }
+         j++;
+      }
    ndev = j;
+   recount_keyboards();
+}
+
+/* Shown whenever no keyboard is detected, so you can see what the device sees. */
+static void read_line_file(const char *path, char *out, size_t n)
+{
+   out[0] = 0;
+   FILE *f = fopen(path, "r");
+   if (!f) return;
+   if (fgets(out, (int)n, f)) out[strcspn(out, "\r\n")] = 0;
+   fclose(f);
+}
+
+static void diag_line(int *y, const char *s, uint16_t col)
+{
+   int n = (int)strlen(s);
+   if (n > 52) n = 52;
+   draw_text(12, *y, s, n, 2, col, 0);
+   *y += 18;
+}
+
+static void draw_diag(void)
+{
+   char buf[300];
+   int y = 10;
+   fill_rect(0, 0, W, H, C_BG);
+   draw_text(12, y, "SCRIPTWRITER - NO KEYBOARD FOUND", 32, 2, C_SCENE, 1);
+   y += 26;
+   diag_line(&y, "Plug in the keyboard dongle; it starts by itself.", C_TEXT);
+   diag_line(&y, "To quit: hold any device button for 2 seconds.", C_TEXT);
+   y += 8;
+   diag_line(&y, "Input devices (K = keyboard, x = not usable):", C_CHAR);
+   if (ndev == 0) diag_line(&y, "  none found in /dev/input", C_PAREN);
+   for (int i = 0; i < ndev && i < 8; i++) {
+      snprintf(buf, sizeof buf, "  [%c] %s", dev_fd[i] < 0 ? 'x' : (dev_kb[i] ? 'K' : '-'),
+            dev_name[i][0] ? dev_name[i] : dev_path[i]);
+      diag_line(&y, buf, C_TEXT);
+   }
+   y += 8;
+   diag_line(&y, "USB devices:", C_CHAR);
+   int shown = 0;
+   DIR *d = opendir("/sys/bus/usb/devices");
+   if (d) {
+      struct dirent *e;
+      while ((e = readdir(d)) && shown < 5) {
+         if (e->d_name[0] == '.') continue;
+         char p[400], prod[96], man[96];
+         snprintf(p, sizeof p, "/sys/bus/usb/devices/%.200s/product", e->d_name);
+         read_line_file(p, prod, sizeof prod);
+         snprintf(p, sizeof p, "/sys/bus/usb/devices/%.200s/manufacturer", e->d_name);
+         read_line_file(p, man, sizeof man);
+         if (!prod[0] && !man[0]) continue;
+         snprintf(buf, sizeof buf, "  %.20s %.30s", man, prod);
+         diag_line(&y, buf, C_TEXT);
+         shown++;
+      }
+      closedir(d);
+   }
+   if (!shown) diag_line(&y, d ? "  nothing detected on USB" : "  /sys/bus/usb not available", C_PAREN);
+   y += 8;
+   diag_line(&y, "Last button event:", C_CHAR);
+   snprintf(buf, sizeof buf, "  %s", last_ev[0] ? last_ev : "(none yet)");
+   diag_line(&y, buf, C_TEXT);
+   diag_line(&y, "Details are saved in scriptwriter.log", C_DIM);
 }
 
 /* ------------------------------------------------- libretro glue / main */
@@ -236,30 +343,33 @@ static int16_t app_input(unsigned a, unsigned b, unsigned c, unsigned d) { (void
 static void app_audio(int16_t l, int16_t r) { (void)l; (void)r; }
 static size_t app_audio_batch(const int16_t *d, size_t n) { (void)d; return n; }
 
+static char app_dir[512];
+
 int main(int argc, char **argv)
 {
-   if (argc > 1) {
-      snprintf(app_save_dir, sizeof app_save_dir, "%s", argv[1]);
-   } else {
-      char exe[512];
-      ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-      if (n > 0) {
-         exe[n] = 0;
-         char *slash = strrchr(exe, '/');
-         if (slash) *slash = 0;
-         snprintf(app_save_dir, sizeof app_save_dir, "%s/scripts", exe);
-      } else {
-         snprintf(app_save_dir, sizeof app_save_dir, "scripts");
-      }
+   char exe[512];
+   ssize_t rn = readlink("/proc/self/exe", exe, sizeof exe - 1);
+   snprintf(app_dir, sizeof app_dir, ".");
+   if (rn > 0) {
+      exe[rn] = 0;
+      char *slash = strrchr(exe, '/');
+      if (slash) { *slash = 0; snprintf(app_dir, sizeof app_dir, "%s", exe); }
    }
+   if (argc > 1) snprintf(app_save_dir, sizeof app_save_dir, "%s", argv[1]);
+   else snprintf(app_save_dir, sizeof app_save_dir, "%s/scripts", app_dir);
    mkdir(app_save_dir, 0755);
-   fprintf(stderr, "saving to: %s\n", app_save_dir);
+
+   char logpath[600];
+   snprintf(logpath, sizeof logpath, "%s/scriptwriter.log", app_dir);
+   logfp = fopen(logpath, "w");
+   LOG("scriptwriter start; saving to %s", app_save_dir);
 
    signal(SIGINT, on_signal);
    signal(SIGTERM, on_signal);
    signal(SIGHUP, on_signal);
 
-   if (fb_open() != 0) return 1;
+   if (fb_open() != 0) { LOG("framebuffer open failed"); return 1; }
+   LOG("framebuffer %ux%u %ubpp", vinfo.xres, vinfo.yres, vinfo.bits_per_pixel);
 
    retro_set_environment(app_env);
    retro_set_video_refresh(app_video);
@@ -269,21 +379,39 @@ int main(int argc, char **argv)
    retro_set_input_state(app_input);
    retro_init();
    struct retro_game_info gi = { "Script.fw", NULL, 0, NULL };
-   if (!retro_load_game(&gi)) { fprintf(stderr, "load failed\n"); return 1; }
+   if (!retro_load_game(&gi)) { LOG("load failed"); return 1; }
 
    struct timespec next;
    clock_gettime(CLOCK_MONOTONIC, &next);
    unsigned long last_render = (unsigned long)-1, ticks = 0;
+   int in_diag = 1;
    while (!quit_flag) {
-      if (ticks++ % 120 == 0) scan_inputs();
+      if (ticks % 120 == 0) scan_inputs();
       poll_inputs();
-      retro_run();
-      if (render_count != last_render) { blit(); last_render = render_count; }
+
+      if (nonkb_down > 0) {   /* failsafe: hold any device button 2s to quit */
+         struct timespec now;
+         clock_gettime(CLOCK_MONOTONIC, &now);
+         if (now.tv_sec - nonkb_since.tv_sec >= 2) { LOG("quit: button held"); break; }
+      }
+
+      if (nkeyboards == 0) {
+         if (!in_diag) { in_diag = 1; save_now(); LOG("keyboard gone"); }
+         if (ticks % 15 == 0) { draw_diag(); blit(); }
+      } else {
+         if (in_diag) { in_diag = 0; dirty = 1; last_render = (unsigned long)-1; LOG("keyboard ready"); }
+         retro_run();
+         if (render_count != last_render) { blit(); last_render = render_count; }
+      }
+      ticks++;
+
       next.tv_nsec += 16666667;
       if (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
       clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
    }
+   save_now();
    retro_unload_game();
    retro_deinit();
+   LOG("clean exit");
    return 0;
 }
