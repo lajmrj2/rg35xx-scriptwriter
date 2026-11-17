@@ -1,0 +1,29 @@
+yaml
+name: Build RG35XX
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
+      - name: Build standalone app (static)
+        run: make app
+      - name: Build libretro core
+        run: make arm
+      - name: Assemble app folder
+        run: |
+          mkdir -p out/Apps/Scriptwriter
+          cp dist/Apps/Scriptwriter.sh out/Apps/
+          cp scriptwriter out/Apps/Scriptwriter/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scriptwriter_app
+          path: out/Apps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libretro_core
+          path: freewrite_libretro.so
